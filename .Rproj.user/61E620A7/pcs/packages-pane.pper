@@ -1,0 +1,7 @@
+{
+    "installOptions": {
+        "installFromRepository": true,
+        "libraryPath": "C:/Users/paul.mainwood/R",
+        "installDependencies": true
+    }
+}

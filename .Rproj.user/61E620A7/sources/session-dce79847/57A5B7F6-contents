@@ -1,0 +1,72 @@
+
+library(lubridate)
+library(conflicted)
+library(tidyverse)
+library(data.table)
+library(bsts)
+library(clipr)
+library(dplyr)
+library(readr)
+
+conflict_prefer("filter", "dplyr")
+conflict_prefer("select", "dplyr")
+conflict_prefer("SuggestBurn", "bsts")
+
+#Set up working directories
+working_directory <- "G:/My Drive/R/Price elasticity/"
+source_file <- "source/price_elasticity_functions.R"
+setwd(working_directory)
+source(source_file)
+
+#Choose an end-date for fitting
+end_date_for_fitting = dmy(01122023)
+
+#Fit models to time period you want:
+country = "DE"
+customer = "Edeka"
+
+inputs <- produce_inputs(country_choice = country, customer_choice = customer)
+series_and_limits <- transform_to_regressors(inputs$input, inputs$products, start_date = dmy(01012012), end_date = end_date_for_fitting, normalise_volume_and_dist = TRUE, transform_price_to_pressure = TRUE, log_transform_prices = TRUE)
+limits <- series_and_limits$limits
+series <- lapply(series_and_limits$series, check_time_series_complete)
+plot(series[[1]])
+
+models <- lapply(seq(1:length(series)), function(s) produce_bsts(series[[s]], inputs$products, lead = s, other_ASP_constant = TRUE, constant_covars = c("Dist", "Christmas"), niter = 3000))
+
+show_charts_for_product(3)
+
+#Products being used
+product_list <- inputs$products
+limits <- limits
+
+#save down for interrogation
+directory_for_csvs <- paste0(working_directory, "csv_outputs/" , customer)
+dir.create(directory_for_csvs)
+
+#Export predictors and coefficients
+predictors_list <- lapply(seq(1:length(inputs$products)), function(i) export_predictors(models[[i]], inputs$products))
+predictors_combined <- do.call("rbind", predictors_list)
+
+#Create output sheets
+coefficients_list <- lapply(seq(1:length(inputs$products)), function(i) export_coefficients(models[[i]], inputs$products))
+coefficients_combined <- do.call("rbind", coefficients_list)
+inputs_combined <- inputs$input %>% rename(Product = Nickname, Base = Vol)
+overall_product_list <- make.names(most_appropriate_product_list(country, "Any"))
+full_list <- c("Week", "Product", "Base", "Feat", "Dist", overall_product_list, "Christmas")
+
+add_missing_columns <- function(df, full_list = c("Week", "Product", "Base", "Feat", "Dist", "innocent.TH.NFC", "innocent.Large.NFC", "innocent.TH.Kids", "innocent.TH.Smoothie", "innocent.TH.S.Smoothie", "Trop.TH.NFC", "Trop.Large.NFC", "Copella.TH.NFC", "Copella.Large.NFC", "Naked.TH.Smoothie", "Happy.Monkey.TH.Kids", "PL.TH.NFC", "PL.TH.Smoothie", "Christmas")){
+  missing_products <- setdiff(full_list, colnames(df))
+  if (length(missing_products) == 0){
+    return(df)}
+  df[missing_products] <- 0
+  names(df)[(ncol(df)-length(missing_products)+1):ncol(df)] <- missing_products
+  return(df %>% select(all_of(full_list)))
+}
+
+                                
+
+write_csv(add_missing_columns(predictors_combined, full_list = full_list), paste0(directory_for_csvs, "/predictors.csv"))
+write_csv(add_missing_columns(coefficients_combined, full_list = full_list), paste0(directory_for_csvs, "/coefficients.csv"))
+write_csv(add_missing_columns(inputs_combined, full_list = full_list), paste0(directory_for_csvs, "/inputs.csv"))
+write_csv(add_missing_columns(limits, full_list = overall_product_list), paste0(directory_for_csvs, "/limits.csv"))
+

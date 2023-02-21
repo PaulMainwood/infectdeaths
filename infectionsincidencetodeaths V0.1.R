@@ -1,0 +1,123 @@
+library(lubridate)
+library(conflicted)
+library(tidyverse)
+library(bsts)
+library(clipr)
+library(dplyr)
+library(readr)
+library(matrixStats)
+library(ggplot2)
+library(reshape2)
+library(stringr)
+library(ISOweek)
+library(openxlsx)
+
+conflict_prefer("filter", "dplyr")
+working_directory <- "G://My Drive/R/infectdeaths"
+
+#Read in deaths data and transform to wide format
+deaths_raw <- read_csv("ONS death certificates.csv")
+deaths <- deaths_raw %>% filter(sex == "all") %>% filter(Deaths == "Deaths involving COVID-19: occurrences") %>% select(Time, Week, 'age-groups', v4_1)
+deaths$Week <- as.integer(str_sub(deaths$Week, 6))
+deaths$Year <- as.integer(deaths$Time)
+deaths <- deaths %>% 
+  select(-c("Time")) %>% 
+  select(c("Year", "Week", "age-groups", "v4_1")) %>% 
+  pivot_wider(names_from = 'age-groups', values_from = v4_1) %>%
+  arrange(Year, Week) %>%
+  na.omit
+
+deaths <- deaths %>% mutate(Date = ISOweek2date(paste0(deaths$Year, "-W", str_pad(deaths$Week, 2, pad = "0"), "-1")))
+
+#Read in infections (incidence) from ONS site
+infections_url <- "https://www.ons.gov.uk/file?uri=/peoplepopulationandcommunity/healthandsocialcare/conditionsanddiseases/datasets/coronaviruscovid19infectionsurveycumulativeincidenceofthepercentageofpeoplewhohavetestedpositiveforcovid19infectionsengland/current/cumulativeincidence.xlsx"
+infections_raw <- read.xlsx(infections_url, sheet = "Table 1", rows = 6:936, cols = 1:26)
+
+#Change from excel numbers to dates
+origin_date <- as.Date("1899-12-30")
+infections_raw$Date <- origin_date + infections_raw$Date
+
+#Read in populations data from Census 2021
+populations <- read_csv("populations selected census21.csv")
+population_matrix <- read_csv("age group matrix.csv")
+
+#Clean infections data; make column names unique, clean and turn into new per day
+colnames(infections_raw) <- make.names(names(infections_raw), unique = TRUE)
+infections_week_num <- infections_raw %>% 
+  mutate(Year = isoyear(Date)) %>% 
+  mutate(Week = isoweek(Date)) %>% 
+  select(c(6, 9, 12, 15, 18, 21, 24, 27, 28)) 
+infections_new_each_day <- infections_week_num %>% select(1:7) %>% as.matrix %>% diff
+infections_cumulative_each_day <- infections_week_num  %>% select(1:7) %>% as.matrix
+infections_cumulative_each_day <- infections_cumulative_each_day[-1,]
+
+infections_cleaned <- ifelse(infections_new_each_day > 0, infections_new_each_day, infections_cumulative_each_day)
+
+#Transform to a weekly read
+infections_weekly <- as.tibble(cbind(infections_week_num$Year[2:length(infections_week_num$Year)], infections_week_num$Week[2:length(infections_week_num$Week)], infections_cleaned))
+colnames(infections_weekly) <- c("Year", "Week", colnames(populations[11:17]))
+infections <- infections_weekly %>% group_by(Year, Week) %>% summarise_all(sum) %>% ungroup 
+
+#Clean some titles on deaths, and then rearrange columns on deaths
+populations <- rename(populations, '1-4' = "01-Apr")
+populations <- rename(populations, '5-9' = "05-Sep")
+populations <- rename(populations, '10-14' = "Oct-14")
+deaths <- relocate(deaths, colnames(populations)[18:37])
+
+#Multiply by the Census 2021 population for each age-group
+infection_numbers <- cbind(select(infections, c(1,2)), sweep(infections[, 3:9], MARGIN = 2, as.matrix(populations[11:17]), `*`))
+infections_final <- infection_numbers %>% mutate(Date = ISOweek2date(paste0(infection_numbers$Year, "-W", str_pad(infection_numbers$Week, 2, pad = "0"), "-1"))) %>% relocate(Date, .after = Week)
+
+deaths_final <-  cbind(select(deaths, c(21:24)), lapply(seq(1:dim(population_matrix)[1]), function(n) rowSums(sweep(deaths[, 1:20], MARGIN = 2, as.matrix(population_matrix[n, 2:dim(population_matrix)[2]]), '*'))))
+colnames(deaths_final) <- c("Year", "Week", "all-ages", "Date", colnames(populations)[11:17])
+
+lag_infs_to_deaths <- 28
+
+first_week <- min(infections_final$Date)
+last_week <- max(infections_final$Date) - lag_infs_to_deaths
+ages <- colnames(infections_final)[4:10]
+
+#Main function for taking like-for-like and pushing into bsts model
+model_with_lag <- function(infections_raw, deaths_raw, first_week, last_week, lag_infs_to_deaths, age_group){
+  
+  #Grab appropriate infections values
+  infections <- infections_raw %>% filter(Date >= first_week) %>% filter(Date <= last_week)
+  infec <- pull(infections, age_group)
+  infec_dates <- infections$Date
+  print(length(infec))
+
+  #Select appropriate hospitalisation values
+  deaths_raw <- deaths_raw %>% filter(Date >= first_week + lag_infs_to_deaths) %>% filter(Date <= last_week + lag_infs_to_deaths)
+  hosp <- pull(deaths_raw, age_group)
+  hosp_dates <- deaths_raw$Date
+  print(length(hosp))
+
+
+  ss <- list()
+  ss <- AddDynamicRegression(ss, hosp ~ infec)
+
+  model <- bsts(hosp, state.specification = ss, niter = 1000)
+  dyn_coeffs <- apply(model$dynamic.regression.coefficients, 3, mean)
+
+
+plot(hosp_dates, dyn_coeffs, type = "l", log = "y")
+return(list(model = model, dyn_coeffs = dyn_coeffs, infec_dates = infec_dates, hosp_dates = hosp_dates, var = var(dyn_coeffs)))
+}
+
+#Example run
+model_with_lag(infections_final, deaths_final, first_week, last_week, lag_infs_to_deaths, ages[6])
+
+#Run for all age-groups and collect for plotting
+b <- lapply(ages, function(n) model_with_lag(infections_final, deaths_final, first_week, last_week, lag_infs_to_deaths, n))
+c <- cbind(b[[1]]$hosp_dates, bind_cols(lapply(seq(1:length(b)), function(n) b[[n]]$dyn_coeffs)))
+colnames(c) <- c("Week", ages)
+data_long <- melt(c, id = "Week") %>% filter(variable != '2-11 modelled')
+
+#Linear plot
+lin_plot <- ggplot(data_long, aes(x = Week, y = value, colour = variable)) +  geom_line(size = 1) + scale_y_continuous(limits = c(0, 0.2))
+lin_plot
+
+#Log plot
+log_plot <- ggplot(data_long, aes(x = Week, y = value, colour = variable)) +  geom_line(size = 1) + scale_y_continuous(trans = "log10", limits = c(0.000001, 0.2), breaks = c(0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1), labels = c("0.0001%", "0.001%", "0.01%", "0.1%", "1%", "10%")) + labs(caption = "Source: ONS infection survey and death certificates, England; experimental methodology based on state-space models; if you use this for anything important you're insane.")
+log_plot
+
